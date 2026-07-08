@@ -1,0 +1,1378 @@
+TLS                                                             G. Davey
+Internet-Draft                                           Davey Group LLC
+Intended status: Standards Track                             7 July 2026
+Expires: 8 January 2027
+
+
+  Bound Routing, Authority, and Identity Data (BRAID): DNSSEC-Anchored
+              Authorization for TLS Delegated Credentials
+                        draft-davey-tls-braid-01
+
+Abstract
+
+   This document defines the BRAID Identity strand, a negotiated TLS
+   profile that augments Delegated Credentials (RFC 9345) with owner-
+   controlled, DNSSEC-authenticated key authorization.  A BRAID server
+   authenticates a TLS connection with a Delegated Credential.  A BRAID
+   client accepts that credential only if it validates under RFC 9345
+   and the credential's public key is listed in a DNSSEC-authenticated
+   BRAID Anchor published by the domain owner.  This creates a two-
+   control use condition: possession of the end-entity private key is
+   insufficient to impersonate a protected domain unless the attacker
+   can also publish an authorized credential key in the owner's DNSSEC-
+   signed zone.  The property holds even when the Anchor and the
+   credential key are static; freshness parameters are an optional
+   enforcement profile that bounds revocation latency and stolen-
+   credential-key exposure, and are not the source of the security
+   property.  Support is negotiated in the handshake, so non-BRAID
+   clients receive conventional certificates and are unaffected.  The
+   document additionally defines a monitor-only deployment mode that
+   runs entirely on infrastructure deployed today, explicit DNSSEC
+   validation modes that state the trust model precisely, and optional
+   future extension profiles for routing and witness assurance.  It
+   does not define or change maximum validity periods for publicly
+   trusted certificates; any longer-lived certificate profile would
+   require separate root-program action supported by deployment
+   evidence.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at https://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six
+   months and may be updated, replaced, or obsoleted by other documents
+   at any time.  It is inappropriate to use Internet-Drafts as
+   reference material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on 8 January 2027.
+
+Copyright Notice
+
+   Copyright (c) 2026 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents (https://trustee.ietf.org/
+   license-info) in effect on the date of publication of this document.
+   Please review these documents carefully, as they describe your
+   rights and restrictions with respect to this document.  Code
+   Components extracted from this document must include Revised BSD
+   License text as described in Section 4.e of the Trust Legal
+   Provisions and are provided without warranty as described in the
+   Revised BSD License.
+
+Table of Contents
+
+   1.  Introduction
+   2.  Non-Goals
+   3.  Terminology
+     3.1.  Requirements language
+   4.  Security Model
+     4.1.  The two-control property
+     4.2.  Threat model summary
+   5.  Comparison with DANE TLSA
+   6.  The Identity Strand
+     6.1.  Construction
+     6.2.  The BRAIDBinding certificate extension
+     6.3.  Delegated name constraints
+   7.  The BRAID Anchor
+     7.1.  Anchor location
+     7.2.  Multi-SAN and wildcard semantics
+     7.3.  TXT transition form
+     7.4.  Anchor content
+   8.  Validation Algorithm
+   9.  DNSSEC Validation Modes
+   10. Negotiation and Certificate Selection
+   11. Proof Transport: braid_chain and Reference-Based Caching
+     11.1. Resource management and denial of service
+   12. Deployment
+     12.1. Monitor-only deployment
+     12.2. Managed strict enforcement
+     12.3. Public-Web enforcement
+     12.4. The freshness profile (BRAID-Agile)
+   13. Operational Considerations
+     13.1. Steady-state operations under BRAID-Base
+     13.2. Rotation at scale under BRAID-Agile
+     13.3. Revocation procedure
+   14. Certificate Validity Periods
+   15. Security Considerations
+   16. Privacy Considerations
+   17. Implementation Status
+   18. IANA Considerations
+   19. Future Extension Profiles: Routing and Witness
+   20. References
+     20.1. Normative References
+     20.2. Informative References
+   Appendix A.  Negative Test Vectors
+   Appendix B.  IETF Work-Split Roadmap
+   Appendix C.  Change Log
+   Author's Address
+
+1.  Introduction
+
+   Certificate revocation for publicly trusted TLS certificates has
+   never worked reliably at internet scale.  Online status checks
+   (OCSP) have been deprecated by major browsers for privacy, latency,
+   and soft-fail reasons; certificate revocation lists are not
+   consulted in a way that protects users; and the ecosystem's
+   response, progressively shorter certificate lifetimes, mitigates
+   the exposure window of a bad certificate without repairing the
+   underlying mechanism.
+
+   The -00 revision of this document attempted to address the lifetime
+   question and the revocation question together.  Review made clear
+   that the two are separable, and that the durable contribution is
+   narrower and stronger than the original framing suggested.  This
+   revision therefore isolates one primitive and builds the document
+   around it:
+
+      A domain owner publishes, under DNSSEC, the set of Delegated
+      Credential public keys currently authorized to authenticate its
+      TLS service.  A client that enforces this check requires both a
+      valid RFC 9345 delegation from the WebPKI end-entity certificate
+      and the owner's Anchor authorization of the credential key.
+      Impersonation therefore requires compromising two independently
+      held controls: the end-entity private key and the owner's DNS
+      publication path.
+
+   This is the two-control property (Section 4.1).  It is a
+   consequence of authorization membership, not of freshness: it holds
+   even when the Anchor is published once and never changed, and even
+   when the operator reuses the same credential key indefinitely.
+   Freshness parameters remain available as an optional enforcement
+   profile (Section 12.4) because they bound two narrower risks --- the
+   useful lifetime of a stolen credential key and the propagation
+   latency of a revocation --- but they are no longer the foundation of
+   the design, and the baseline profile imposes no recurring DNS-side
+   or CA-facing operations (Section 13.1).
+
+   BRAID does not claim to eliminate automation.  It changes what must
+   be automated and who controls the failure domain.  Conventional
+   short-lived certificates require repeated public issuance events:
+   CA interaction, domain-control validation, rate limits, profile
+   compliance, and CT logging, on an external party's schedule,
+   availability, and commercial terms.  Under BRAID-Base, the
+   security-bearing artifacts --- the Anchor RRset and the credential
+   key --- are static; the only recurring operation is re-signing the
+   Delegated Credential locally with the end-entity key the operator
+   already holds, an operation with no external dependency, no domain
+   validation, and no DNS write, whose failure is visible to the
+   operator's own monitoring before it affects anyone (Section 13.1).
+
+   Two design principles carry over from -00.  First, reuse over
+   reinvention: BRAID composes Delegated Credentials [RFC9345], the
+   TLS Feature extension [RFC7633], Subject Information Access and
+   GeneralSubtrees [RFC5280], and DNSSEC, each with deployed parsers
+   and operational history; the new parsing surface is a single short
+   extension sequence and one resource record.  Second, keep expensive
+   validation off the client's critical path and state the trust model
+   precisely: this revision replaces the -00 resolver story with two
+   explicit DNSSEC validation modes (Section 9), so that a verifier
+   always knows, and a reviewer can always determine, exactly what is
+   trusted.
+
+   BRAID changes nothing for parties that do not adopt it.  Support is
+   negotiated (Section 10): a server presents a BRAID certificate only
+   to a client that has offered to validate it, and presents a
+   conventional certificate to all others.  Deployment is staged
+   (Section 12), beginning with a monitor-only mode that requires no
+   new client, CA, TLS, or root-program change and is independently
+   useful on day one.
+
+2.  Non-Goals
+
+   Stating what this document does not attempt is part of its design.
+   BRAID-Base:
+
+   *  does not replace WebPKI certificate validation; the Authority
+      strand (the CA-signed certificate) remains required;
+
+   *  does not remove the need for conventional certificates while
+      non-BRAID clients exist, and does not remove the operator's
+      existing renewal automation for those certificates;
+
+   *  does not mandate in-band DNSSEC validation by general-purpose
+      browsers; the validation modes of Section 9 state exactly what
+      each deployment class trusts;
+
+   *  does not define, request, or imply any change to maximum
+      validity periods for publicly trusted certificates, which are
+      set by root-program policy and the CA/Browser Forum, not the
+      IETF (Section 14);
+
+   *  does not prevent impersonation by an attacker who simultaneously
+      compromises both the end-entity private key and the owner's DNS
+      publication path; and
+
+   *  does not require routing-origin validation, witness co-signing,
+      revocation transparency, or private-use gating; these are
+      extension profiles (Section 19) and are not prerequisites for
+      implementing or deploying anything in this document.
+
+3.  Terminology
+
+   Anchor (BRAID Anchor):  A DNSSEC-signed RRset, published by the
+      domain owner, listing the Delegated Credential public keys (by
+      hash) currently authorized to authenticate TLS for a DNS-ID.
+
+   Anchor entry:  One authorized-key record within the Anchor RRset.
+
+   Credential key:  The public/private key pair whose public half is
+      carried in a Delegated Credential and whose private half signs
+      the TLS handshake.
+
+   DNS-ID:  A DNS domain name identity presented in a certificate's
+      subjectAltName extension, per [RFC6125].
+
+   End-entity (EE) key:  The subject key pair of the server's CA-
+      issued certificate; under [RFC9345] the EE private key signs
+      Delegated Credentials.
+
+   Identity strand:  The owner-controlled authorization layer defined
+      by this document: an RFC 9345 Delegated Credential whose public
+      key is authorized by the Anchor.
+
+   Authority strand:  The CA-signed X.509 certificate, validated under
+      normal WebPKI rules [RFC5280], logged to Certificate
+      Transparency.
+
+   Two-control property:  The property that impersonation of a
+      protected domain requires both the EE private key and write
+      access to the owner's DNSSEC-signed zone (Section 4.1).  (The
+      -00 revision called this the "two-key property".)
+
+   BRAID-Base:  The baseline profile: Authority strand plus Identity
+      strand with membership checking only; static Anchor and static
+      credential key permitted.
+
+   BRAID-Agile:  The optional freshness enforcement profile
+      (Section 12.4).
+
+3.1.  Requirements language
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY",
+   and "OPTIONAL" in this document are to be interpreted as described
+   in BCP 14 [RFC2119] [RFC8174] when, and only when, they appear in
+   all capitals, as shown here.
+
+4.  Security Model
+
+4.1.  The two-control property
+
+   The Identity strand is an owner-controlled authorization layer for
+   the TLS credential key used by the server.  It composes RFC 9345
+   Delegated Credentials with a DNSSEC-authenticated BRAID Anchor.
+   The Delegated Credential proves that the end-entity certificate key
+   delegated authority to a credential key; the Anchor proves that the
+   domain owner currently authorizes that credential key for use.  The
+   Identity strand validates only when both statements are true.
+
+   The resulting security property is independent of freshness
+   cadence.  An adversary who steals the end-entity private key can
+   mint syntactically valid Delegated Credentials --- [RFC9345] alone
+   cannot prevent that, since the end-entity key is the delegator.
+   But those credentials name adversary-chosen public keys, and the
+   adversary cannot cause those keys to appear in the owner's DNSSEC-
+   signed Anchor RRset without separately compromising the owner's DNS
+   publication path.  Conversely, an adversary who compromises the
+   owner's zone can publish Anchor entries but holds no CA-signed
+   certificate and no end-entity key with which to mint a credential
+   those entries would authorize.  Impersonation therefore requires
+   the simultaneous compromise of two independently held and
+   independently operated controls:
+
+      (1) the end-entity private key, and
+      (2) write access to the owner's DNSSEC-signed zone.
+
+   Crucially, this holds even when the Anchor RRset and the credential
+   key are completely static.  A long-lived credential key that the
+   thief does not possess is as useless to the thief as a short-lived
+   one; what defeats the thief is that the client checks membership of
+   the handshake key in the owner's Anchor, not that the key changes
+   often.  Freshness parameters (Section 12.4) bound two narrower and
+   genuinely distinct risks: how long a stolen *credential* key
+   remains usable before its Anchor entry or credential interval
+   lapses, and how quickly an owner-initiated de-authorization
+   propagates globally.  Both are valuable; neither is the source of
+   the two-control property.
+
+   To preserve the independence of the two controls in practice, the
+   DNS update credential used to publish the Anchor SHOULD NOT be
+   resident on the TLS-terminating hosts that hold the end-entity or
+   credential keys, and the zone's DNSSEC signing key SHOULD be
+   operated per current best practice (offline or HSM-held where
+   feasible).  Section 15 analyzes the collapse of the property when
+   this separation is not maintained.
+
+4.2.  Threat model summary
+
+   +==================+===============================================+
+   | Attack           | Disposition under this document               |
+   +==================+===============================================+
+   | Stolen end-      | Defeated by the Identity strand: attacker-    |
+   | entity private   | minted credentials name keys absent from the  |
+   | key              | Anchor and fail membership (Section 4.1)      |
+   +------------------+-----------------------------------------------+
+   | Stolen           | De-authorized by one Anchor update; under     |
+   | credential key   | BRAID-Agile additionally bounded by the       |
+   |                  | freshness window (Section 12.4)               |
+   +------------------+-----------------------------------------------+
+   | Mis-issued or    | Fails Identity: the owner's Anchor never      |
+   | fraudulent       | authorized the fraudulent certificate's       |
+   | certificate (CA  | credentials; CT logging provides detection    |
+   | compromise)      | as today                                      |
+   +------------------+-----------------------------------------------+
+   | Compromise of    | Insufficient alone: attacker can publish      |
+   | owner's DNS      | Anchor entries but holds no CA-signed         |
+   | zone alone       | certificate and no EE key to delegate from    |
+   +------------------+-----------------------------------------------+
+   | Simultaneous     | Out of scope for BRAID-Base (Section 2);      |
+   | compromise of    | addressed by the Witness extension profile    |
+   | both controls    | (Section 19)                                  |
+   +------------------+-----------------------------------------------+
+   | Downgrade to a   | BRAID Policy record, policy caching, and      |
+   | conventional     | optional preloading (Section 10)              |
+   | certificate      |                                               |
+   +------------------+-----------------------------------------------+
+   | Unavailable      | Strict Identity fails closed; degradation is  |
+   | Anchor or proof  | prohibited for strict Identity (Section       |
+   | material         | 12.3); monitor mode is unaffected             |
+   +------------------+-----------------------------------------------+
+
+                                 Table 1
+
+5.  Comparison with DANE TLSA
+
+   The closest existing mechanism is DANE TLSA [RFC6698], and the
+   comparison deserves precision, because a superficial reading makes
+   the two appear equivalent: both publish key material in a DNSSEC-
+   signed zone and both give the owner a record they can withdraw.
+   The difference is in what object the record vouches for, and it is
+   decisive in the stolen-key case.
+
+   TLSA certificate usage 1 (PKIX-EE) binds the DNSSEC-authenticated
+   name to the end-entity certificate or its public key, in addition
+   to normal PKIX validation.  This is valuable against mis-issuance:
+   a certificate issued by another CA for the same name fails the TLSA
+   match.  But it does not, by itself, prevent use of a stolen end-
+   entity private key: the attacker presents the same certificate and
+   proves possession of the same key that the TLSA record
+   authenticates.  The record vouches for exactly the object that was
+   stolen, so the check passes.  The same analysis applies to usage 3
+   (DANE-EE).
+
+   BRAID authenticates a different object.  The Anchor authorizes the
+   public key of the Delegated Credential permitted to authenticate
+   the connection --- a key one delegation step removed from the end-
+   entity key.  A stolen end-entity key lets the attacker mint a
+   syntactically valid credential, but does not let the attacker place
+   that credential's public key into the owner's Anchor.  A strict
+   Identity verifier therefore rejects the attacker-minted credential.
+   This is the two-control property, and TLSA cannot express it,
+   because TLSA has no vocabulary for authorizing a key other than the
+   one in (or matching) the presented certificate.
+
+   The revocation semantics also differ in a way that matters
+   operationally.  Withdrawing a TLSA usage 1 record to "revoke"
+   affects the legitimate service and the attacker identically ---
+   both present the same certificate and key --- so revocation-by-
+   withdrawal is also self-inflicted denial of service, and it is only
+   meaningful at all to clients that treat the record's absence as
+   fatal, which requires a separate signal that the domain requires
+   TLSA (otherwise absence simply means "no TLSA deployed" and clients
+   fall back to ordinary PKIX acceptance).  Under BRAID, the
+   requirement signal is signed into the certificate itself as a
+   critical extension (Section 6.2), so absence of authorization is
+   fatal by construction for BRAID-negotiated connections; and
+   revocation is selective: the owner removes the compromised
+   credential key's Anchor entry while the service continues on a
+   different authorized key, de-authorizing the attacker without an
+   outage.
+
+   Finally, this document does not treat the limited deployment of
+   TLSA for the public web as evidence against BRAID's deployability,
+   for two reasons that the design reflects.  First, TLSA's marginal
+   security value over WebPKI validation is contested precisely
+   because of the stolen-key analysis above; BRAID's marginal value is
+   the two-control property, which is a different and demonstrably
+   stronger claim.  Second, TLSA-for-web foundered on in-band client
+   DNSSEC validation with an implicit trust model; this document makes
+   the trust model explicit and modal (Section 9) and defines a
+   deployment mode requiring no client changes at all (Section 12.1).
+
+6.  The Identity Strand
+
+6.1.  Construction
+
+   The mechanism composes three parts, of which only the third is new:
+
+   1.  *The Delegated Credential, per [RFC9345] unchanged.*  The
+       operator mints a credential --- a public key and a validity
+       interval, which [RFC9345] caps at seven days from issuance ---
+       signed by the end-entity certificate's private key, exactly as
+       [RFC9345] specifies.  The server signs the handshake with the
+       credential's private key.  Note that the seven-day cap bounds
+       the credential *object*, not the credential *key*: an operator
+       MAY re-sign successive credentials over the same key pair, in
+       which case the Anchor never changes (Section 13.1).
+
+   2.  *The BRAID Anchor.*  The domain owner publishes, in its DNSSEC-
+       signed zone at the name determined by Section 7.1, an Anchor
+       RRset listing the credential public keys (by hash) authorized
+       to serve the DNS-ID.  The RRset MAY list several keys to permit
+       overlap during rotation.  Under BRAID-Base the RRset is
+       published once and changed only to rotate or revoke a key.
+
+   3.  *The client's conjunctive check.*  A client enforcing the
+       Identity strand MUST verify all of: (a) the Delegated
+       Credential validates under [RFC9345] against the end-entity
+       certificate; (b) the handshake was authenticated by the
+       credential's key; and (c) the hash of the credential's public
+       key appears in the DNSSEC-authenticated Anchor RRset applicable
+       to the validated DNS-ID.  Failure of any check fails the
+       strand.  The complete algorithm, including freshness and name-
+       constraint steps, is given in Section 8.
+
+6.2.  The BRAIDBinding certificate extension
+
+   A BRAID certificate carries a critical X.509 extension,
+   BRAIDBinding, declaring that the Identity strand is REQUIRED and
+   carrying the minimal parameters needed to locate and verify it.
+   Because the extension is critical [RFC5280], a client that does not
+   implement BRAID rejects the certificate rather than treating it as
+   an ordinary certificate; this prevents silent downgrade to single-
+   control validation.  Presentation to non-BRAID clients is prevented
+   by the negotiation of Section 10, so criticality never strands a
+   legacy client.
+
+   BRAIDBinding contains:
+
+   *  a strand requirement indicator; in this document only the
+      Identity strand is defined as REQUIRABLE (the Authority strand
+      is always present; Routing and Witness indicators are reserved
+      for the extension profiles of Section 19);
+
+   *  OPTIONALLY an Anchor-name override, constrained by the rules of
+      Section 7.1;
+
+   *  OPTIONALLY the freshness parameters of the BRAID-Agile profile
+      (Section 12.4): a maximum acceptable credential age, not to
+      exceed the [RFC9345] seven-day maximum;
+
+   *  OPTIONALLY the delegated name constraints of Section 6.3,
+      expressed in the GeneralSubtrees syntax of [RFC5280]; and
+
+   *  the policy mode under which the certificate was issued
+      (Section 12).
+
+   In addition, the certificate SHOULD carry the TLS Feature extension
+   [RFC7633] listing the braid_chain ExtensionType, declaring in the
+   long-standing "must-staple" idiom that the handshake is required to
+   include the BRAID material; this gives middleware and audit tooling
+   that already parses [RFC7633] visibility into the requirement
+   without new code.  Locators (the URI of an optional proof
+   repository) are carried as GeneralName access descriptors in the
+   Subject Information Access extension [RFC5280].  The precise ASN.1
+   module is deferred to a companion LAMPS document (Appendix B); the
+   new parsing surface is deliberately a single short sequence.
+
+6.3.  Delegated name constraints
+
+   A Delegated Credential inherits the full name scope of the end-
+   entity certificate that signs it: [RFC9345] provides no means to
+   limit which of the certificate's identities a given credential may
+   assert.  Where credentials are handed to a third party such as a
+   CDN edge, this over-authorizes the holder: a compromised edge
+   credential can impersonate any name on the certificate, including
+   sensitive subdomains.  Because X.509 Name Constraints [RFC5280] are
+   issued by CAs and do not apply to Delegated Credentials, BRAID
+   closes the gap at the policy layer: the delegated name constraints
+   carried in BRAIDBinding enumerate the identities a credential is
+   permitted to assert.  A client enforcing the Identity strand MUST
+   reject a Delegated Credential whose asserted identity falls outside
+   this set.
+
+   Matching follows [RFC6125], with the following precision so that no
+   edge ambiguity survives in multi-tenant deployments: comparison is
+   performed on lowercase A-labels (the Punycode form for
+   internationalized names); a wildcard is permitted only as the
+   entire left-most label; partial-label wildcards, including any
+   wildcard within an A-label such as xn--*, MUST NOT be accepted; a
+   wildcard never matches the apex or a multi-label suffix; and a name
+   that is syntactically malformed under these rules fails the
+   Identity strand rather than being repaired or partially matched.
+   An empty or absent constraint set means the credential inherits the
+   certificate's full name scope, exactly as under [RFC9345] today, so
+   the field is strictly additive.  In combination with per-edge
+   Anchor entries --- each edge's credential key listed separately, so
+   any one edge can be de-authorized by removing one entry --- this
+   makes third-party serving deployments materially safer at no added
+   handshake cost.
+
+7.  The BRAID Anchor
+
+7.1.  Anchor location
+
+   The -00 revision located the Anchor "at the name given in the
+   certificate", which is too loose: it invites ambiguity around
+   aliasing, cross-domain pointers, CNAME chains, public suffixes, and
+   who may publish for whom.  This revision replaces it with a
+   deterministic rule.
+
+   For each DNS-ID validated in the certificate, the default Anchor
+   name is:
+
+      _braid.<DNS-ID>
+
+   A BRAIDBinding MAY specify a different Anchor name only if that
+   name is beneath the same DNS-ID or beneath the same registrable
+   domain, and the delegation path to that name is DNSSEC-
+   authenticated.  A BRAID certificate MUST NOT rely on an Anchor
+   outside the authenticated DNS identity boundary unless an explicit
+   DNSSEC-authenticated indirection record published at the default
+   Anchor name authorizes that external Anchor.  CNAME chasing alone
+   is NOT sufficient to authorize an external Anchor: an unsigned or
+   merely-followed alias does not transfer authorization authority.
+
+7.2.  Multi-SAN and wildcard semantics
+
+   When a certificate contains multiple DNS-IDs, a client MUST
+   validate the Anchor applicable to the DNS-ID used for [RFC6125]
+   name validation on this connection.  Authorization for one DNS-ID
+   does not authorize another DNS-ID in the same certificate unless
+   the Anchor entry explicitly identifies the covered DNS-ID set and
+   that set is within the certificate's subjectAltName extension.
+
+   For a wildcard DNS-ID (*.example.com), the default Anchor name is
+   formed from the parent domain (_braid.example.com), and an Anchor
+   entry covering a wildcard DNS-ID applies to exactly the names the
+   wildcard matches under [RFC6125]; it does not cover the apex.
+
+7.3.  TXT transition form
+
+   Until the BRAID Anchor RRTYPE (Section 18) is widely supported by
+   provisioning systems, the RRset MAY equivalently be published as a
+   TXT record at the same _braid-prefixed name.  SPF, DKIM, and DMARC
+   each launched on TXT records and demonstrated that this path
+   carries production traffic at internet scale.  A validator MUST
+   treat a DNSSEC-validated TXT-form Anchor as equivalent to the
+   native RRTYPE during the transition; all authentication and
+   location rules of this section apply identically to the TXT form.
+
+7.4.  Anchor content
+
+   Each Anchor entry contains: a hash algorithm identifier; the hash
+   of an authorized credential public key, computed over the
+   credential's canonical public-key encoding; OPTIONALLY a covered
+   DNS-ID set (Section 7.2); and OPTIONALLY an entry validity interval
+   used by the BRAID-Agile profile (Section 12.4).  Under BRAID-Base,
+   entries without a validity interval are valid while published.
+   The wire format of the RRTYPE and the canonical key encoding are
+   deferred to the companion DNSOP document (Appendix B).
+
+8.  Validation Algorithm
+
+   Prose-only validation invites corner cases; the normative check is
+   therefore stated as an algorithm.  A client enforcing the Identity
+   strand executes IdentityValidate and MUST fail closed on any
+   missing, malformed, stale, or ambiguous input.
+
+   IdentityValidate(cert, dc, handshake, anchor_rrset, policy):
+
+     1.  Verify cert under normal WebPKI rules [RFC5280], including
+         [RFC6125] name validation of the DNS-ID for this connection.
+     2.  Verify cert contains a critical BRAIDBinding extension
+         requiring the Identity strand.
+     3.  Verify dc is a valid [RFC9345] Delegated Credential for
+         cert, including its validity interval.
+     4.  Verify the TLS handshake was authenticated by dc.public_key.
+     5.  Canonicalize dc.public_key per the Anchor hash algorithm.
+     6.  Verify anchor_rrset is DNSSEC-authenticated under the trust
+         mode required by policy (Section 9).
+     7.  Verify anchor_rrset's name is authorized for the validated
+         DNS-ID under the location rules of Section 7.1 and the
+         multi-SAN rules of Section 7.2.
+     8.  Verify Hash(dc.public_key) appears in anchor_rrset, and that
+         the matching entry covers the validated DNS-ID.
+     9.  If freshness is required by cert or by relying-party policy
+         (Section 12.4), verify the dc validity interval and the
+         Anchor entry validity interval satisfy that policy.
+     10. If delegated name constraints are present (Section 6.3),
+         verify the asserted DNS-ID against them.
+     11. On any failure, abort the handshake; no other strand or
+         mechanism compensates for an Identity failure in strict
+         mode (Section 12.3).
+
+9.  DNSSEC Validation Modes
+
+   A frequent and fair criticism of DNS-anchored TLS mechanisms is
+   that "the client validates DNSSEC" conceals several very different
+   trust models, some of which (trusting an unauthenticated resolver's
+   AD bit across an open network) are not security mechanisms at all.
+   A BRAID verifier MUST therefore know which trust mode it operates
+   in, and a certificate or policy that requires one mode MUST NOT be
+   satisfied by a weaker one.
+
+   *Public-Web strict mode.*  The verifier validates the DNSSEC proof
+   chain for the Anchor RRset itself, using material that is self-
+   authenticating end to end: cached chains, chains fetched by
+   reference (Section 11), material stapled by the server, or an
+   authenticated snapshot distributed with the client software (in the
+   manner of preloaded HSTS lists and CRLite-style revocation
+   snapshots, which demonstrate that browser-distributed authenticated
+   data sets are an operational reality today).  The verifier MUST NOT
+   treat an unauthenticated resolver response, including an
+   unauthenticated AD bit, as sufficient in this mode.
+
+   *Managed-Resolver mode.*  Enterprise, mobile-operator, or managed-
+   endpoint deployments MAY rely on an authenticated, encrypted
+   channel (such as DNS over TLS [RFC7858] or DNS over HTTPS
+   [RFC8484]) to a validating resolver operated under the relying
+   party's own administrative policy.  This mode trades cryptographic
+   self-sufficiency for operational simplicity and is appropriate
+   exactly where the resolver is part of the relying party's trusted
+   computing base.
+
+   This split does not make public-web deployment easy; it makes the
+   trust model honest.  The monitor-only mode of Section 12.1 requires
+   neither, because no client behavior changes at all; managed
+   environments (Section 12.2) have Managed-Resolver mode available
+   today; and the Public-Web strict mode is gated behind the
+   deployment evidence of Section 12.3 rather than assumed.
+
+10.  Negotiation and Certificate Selection
+
+   BRAID requires TLS 1.3 or later [RFC8446]; the Identity strand
+   inherits this floor from Delegated Credentials [RFC9345].  Because
+   BRAIDBinding is critical, a non-BRAID client would reject a BRAID
+   certificate; BRAID therefore MUST be negotiated, and a server MUST
+   NOT present a BRAID certificate to a client that has not offered to
+   validate it.
+
+   *Client signal.*  A BRAID-capable client offers the braid_chain
+   extension (Section 11) in its ClientHello, alongside the
+   delegated_credential extension of [RFC9345].  The presence of
+   braid_chain in the ClientHello is the client's declaration that it
+   implements this document and will enforce the certificate's
+   required strands.
+
+   *Server certificate selection.*  A server operating a BRAID
+   deployment holds both a BRAID certificate and a conventional
+   certificate for the same identity.  If the ClientHello offers
+   braid_chain, the server SHOULD select the BRAID certificate and
+   respond with the braid_chain extension; otherwise it MUST select
+   the conventional certificate and complete an ordinary TLS 1.3
+   handshake.  This mirrors the certificate-selection model already
+   deployed for Delegated Credentials and signature-algorithm
+   negotiation; BRAID adoption is invisible to every legacy client.
+
+   *Operational isolation.*  A BRAID certificate MUST NOT be
+   configured as the default or fallback certificate of any listener;
+   it is selected only on an affirmative braid_chain offer, and a
+   server that cannot determine the offer state MUST serve the
+   conventional certificate.  The failure direction of
+   misconfiguration is safe (a legacy client shown a BRAID certificate
+   fails loudly on the unrecognized critical extension, never silently
+   with weakened validation) and observable (such failures surface in
+   the monitor-phase telemetry of Section 12.1 before enforcement is
+   enabled).
+
+   *Downgrade resistance.*  Negotiation creates a first-contact
+   downgrade surface: an attacker holding a stolen conventional
+   certificate for the domain could strip the braid_chain offer or
+   simply answer with the conventional certificate.  Three graduated
+   mitigations apply.  First, the owner publishes a DNSSEC-signed
+   BRAID Policy record whose strict mode instructs BRAID-capable
+   clients that the domain MUST present a BRAID certificate; a client
+   that has validated such a record MUST reject a conventional
+   certificate for that domain.  Second, domains MAY be enrolled in a
+   preloaded BRAID-required set distributed with client software, in
+   the manner of HSTS [RFC6797], protecting even first contact.
+   Third, a client SHOULD cache a domain's observed BRAID policy for
+   its stated lifetime.  The conventional certificate a BRAID operator
+   holds is, by design, short-lived under prevailing root-program
+   rules, so the residual downgrade exposure is bounded by the shorter
+   of the policy-record lifetime and that certificate's own lifetime.
+
+11.  Proof Transport: braid_chain and Reference-Based Caching
+
+   A naive design that staples complete DNSSEC proof chains into every
+   handshake inflates the server's first flight and burdens every
+   connection with material that changes rarely.  BRAID transports
+   proofs by reference, not by value.
+
+   The Anchor is authorization state, not per-connection status.  A
+   verifier checks whether the credential key used in the handshake is
+   among the owner-authorized keys in a DNSSEC-authenticated RRset;
+   nothing about that check requires contacting a third party per
+   connection.  A client MUST NOT perform a per-connection query to a
+   third-party status service as a prerequisite for strict Identity
+   validation.  Cache-miss retrieval of proof material is permitted
+   only when the retrieved object is self-authenticating by hash and
+   when the retrieval policy does not reveal per-origin browsing
+   behavior to an unrelated third party.
+
+   *  The server sends compact identifiers --- a hash and, optionally,
+      a URI --- for the validation material (the DNSSEC chain to the
+      Anchor) via the braid_chain TLS extension, whose presence in the
+      ClientHello also serves as the negotiation signal (Section 10).
+
+   *  Clients maintain a cache of validated chains, keyed by hash.
+      Because the referenced material changes rarely (under BRAID-Base,
+      only on rotation or revocation), the steady-state handshake
+      carries only the Delegated Credential and the compact
+      references.
+
+   *  Only on a cache miss does the client fetch the full chain ---
+      preferentially from the server it is connecting to (which learns
+      nothing it does not already know), or from a repository only
+      over a privacy-preserving transport such as Oblivious HTTP
+      [RFC9458] or via a batched, prefetched snapshot.  A client MUST
+      NOT emit a per-connection identifying query to a third-party
+      repository as a matter of course.
+
+   Each reference is a cryptographic hash of the material it names.  A
+   client MUST verify that fetched or cached content matches the
+   referenced hash before relying on it; the URI, if present, is a
+   convenience locator only and is never trusted on its own.  Caches
+   keyed by hash are self-certifying and safely shareable across
+   connections and origins.  In-band stapling of a full DNSSEC chain,
+   in the style of the experimental [RFC9102], is supported only as an
+   OPTIONAL fallback and is not a load-bearing dependency.
+
+11.1.  Resource management and denial of service
+
+   A reference cache is itself an attack surface.  Four properties
+   bound it.  First, the number of references per handshake is
+   derivable, not open-ended: a server presents at most one reference
+   per required strand plus one for the policy record, and a client
+   MUST reject a braid_chain extension exceeding that bound.  Second,
+   admission is verification-gated: only material whose hash has been
+   checked is stored, so unresolvable or malformed references occupy
+   no cache space.  Third, eviction and allocation are the client's to
+   govern: caches SHOULD use recency-based eviction with per-origin
+   allocation limits.  Fourth, failure is negatively cached: a
+   reference whose fetch fails SHOULD be recorded as unavailable for a
+   bounded interval rather than triggering repeated fetches.  Fetched
+   material MUST be size-bounded before parsing; the largest
+   legitimate object, a DNSSEC chain, is a few kilobytes, so a limit
+   of 16 KB is ample.
+
+12.  Deployment
+
+   Deployment is staged so that each stage delivers standalone value
+   with no dependence on a later stage: no flag day, no stranded
+   investment, and no adopter waiting on someone else.
+
+12.1.  Monitor-only deployment
+
+   A domain MAY publish a BRAID Anchor before any client enforces
+   BRAID.  In monitor-only mode, third-party monitors and the domain
+   operator compare the Delegated Credential keys observed at TLS
+   endpoints with the keys authorized in the Anchor.  A mismatch does
+   not affect client connections, but it is operationally useful: it
+   detects unauthorized credential deployment, stale edge
+   configuration, accidental key reuse, and a class of serving states
+   not visible in Certificate Transparency --- CT shows what
+   certificates exist, while an Anchor mismatch shows a certificate or
+   credential serving traffic that the owner never authorized.
+
+   Monitor-only deployment requires no new TLS extension, no new
+   certificate profile, no browser change, and no root-program change:
+   its entire mechanism is DNS publication plus out-of-band
+   comparison.  The cost of starting is a DNS record and a monitoring
+   job, nothing published is thrown away later, and the owner acquires
+   and rehearses an owner-controlled de-authorization capability
+   (rotating the Anchor and observing propagation) before any client
+   depends on it.  It is therefore the first deployment target and the
+   recommended initial implementation target.
+
+12.2.  Managed strict enforcement
+
+   Enterprises, financial institutions, and closed networks operate
+   their own root programs and control both endpoints, so they are not
+   gated on public root-program or browser decisions.  They can issue
+   certificates carrying BRAIDBinding under private-use codepoints,
+   enforce the Identity strand in managed clients under the Managed-
+   Resolver mode of Section 9, and generate the fail-closed
+   operational record that public-web standardization will ask for ---
+   in exactly the regulated, high-assurance environments that want the
+   strongest guarantees first.
+
+12.3.  Public-Web enforcement
+
+   Public CAs issue BRAID certificates at whatever maximum lifetime
+   root programs then require, and clients ship validation behind a
+   flag, progressing domains through monitor, staged, and strict
+   policy modes as telemetry warrants, in the manner of DMARC's
+   none/quarantine/reject ladder.  The one root-program ask is small
+   and severable from lifetimes: permitting the single BRAIDBinding
+   extension in leaf certificates requires a scoped certificate-
+   profile ballot --- a permission-to-carry change, not a lifetime
+   change.  A BRAID certificate at prevailing lifetimes is already
+   strictly stronger than a conventional one: owner-controlled de-
+   authorization, defense against stolen end-entity keys and CA
+   compromise via the independent Anchor, and delegated name
+   constraints for third-party serving.
+
+   Graceful degradation MUST NOT satisfy a public-Web policy that
+   requires the Identity strand in strict mode.  If the Identity
+   strand is required and the client cannot authenticate the Anchor
+   under the required trust mode, the connection fails.  A relying
+   party MAY configure local enterprise exceptions outside the public-
+   Web profile, but such exceptions are local policy and do not
+   constitute BRAID strict validation.  This rule is deliberate:
+   BRAID's central claim is fail-closed enforcement, and a mechanism
+   that claims fail-closed while permitting soft-fail under
+   operational pressure recreates the failure mode that discredited
+   OCSP and must-staple.  Fail-closed is painful but honest; the
+   staged policy ladder and the monitor telemetry exist precisely so
+   that operators reach strict mode with evidence rather than hope.
+
+12.4.  The freshness profile (BRAID-Agile)
+
+   BRAID-Agile is an OPTIONAL enforcement profile, selected in
+   BRAIDBinding or by relying-party policy, under which the verifier
+   additionally enforces bounds on credential age and Anchor-entry
+   validity (step 9 of Section 8).  High-assurance operators opt in
+   to a strict freshness window --- as short as 24 hours, at most the
+   [RFC9345] seven-day maximum --- accepting an automated key-rotation
+   obligation in exchange for two bounded exposures: a stolen
+   credential key becomes useless when its window lapses even if the
+   owner never notices the theft, and an owner-initiated de-
+   authorization is globally effective within one window even against
+   caches that have not observed the Anchor change.
+
+   BRAID-Agile changes the operational posture, not the security
+   model: the two-control property of Section 4.1 is identical in both
+   profiles.  An operator SHOULD choose BRAID-Agile only where its
+   rotation discipline meets the bar of Section 13.2.
+
+13.  Operational Considerations
+
+13.1.  Steady-state operations under BRAID-Base
+
+   Under BRAID-Base the steady state involves no DNS-side automation
+   and no CA-facing automation attributable to BRAID:
+
+   *  The Anchor RRset is written once and changed only for rotation
+      or revocation.  The DNS publication path is exercised on the
+      owner's initiative, not on a renewal clock.
+
+   *  The credential key pair MAY be long-lived.  Because [RFC9345]
+      caps the credential object at seven days, the operator re-signs
+      a fresh credential over the same key pair on a local schedule.
+      This is the only recurring operation, and it is local and self-
+      contained: it requires no CA interaction, no domain-control
+      validation, no rate-limit exposure, no CT logging event, and no
+      DNS write.  It is performed with the end-entity key the operator
+      already holds, can be pre-computed arbitrarily far in advance
+      within the seven-day bound, and its failure is visible to the
+      operator's own monitoring (the server simply has no fresh
+      credential to present) rather than manifesting first as a
+      client-side validation failure against a third party.
+
+   *  The conventional certificate for non-BRAID clients continues to
+      renew under the operator's existing ACME automation [RFC8555],
+      unchanged; BRAID neither adds to nor removes that obligation
+      (Section 2).
+
+   The contrast with must-staple is the location of the failure
+   domain: must-staple's fresh evidence came from a third party the
+   operator did not control (the CA's OCSP responder), whose outages
+   forced soft-fail; BRAID-Base's only recurring artifact is minted by
+   the operator, on the operator's hardware, from the operator's key.
+   More generally, the recurring operations BRAID-Base does involve
+   --- local credential re-signing and, on the owner's initiative,
+   Anchor updates --- are owner-scheduled operations against
+   infrastructure the owner controls, whereas each certificate
+   issuance event is a transaction with an external party, subject to
+   that party's API availability, rate limits, validation-method
+   requirements, and commercial terms.  Reducing the frequency of the
+   latter class of operation, where a relying-party ecosystem permits
+   it, is therefore an operational simplification in kind and not only
+   in count.
+
+13.2.  Rotation at scale under BRAID-Agile
+
+   The freshness window is only as safe as the rotation discipline
+   behind it, and large anycast or multi-region fleets face real
+   propagation lag.  Three practices, borrowed from DNSSEC key-
+   rollover operations, bound the fail-closed surface: the next
+   window's credential key SHOULD be pre-published in the Anchor RRset
+   before any server presents it, so propagation completes while the
+   previous key is still serving; the Anchor RRset's TTL SHOULD be a
+   small fraction of the freshness window; and fleets SHOULD stagger
+   credential validity across regions rather than expiring globally at
+   one instant.  With pre-publication in place, the steady state
+   always has at least two authorized keys in the Anchor --- current
+   and next --- and a rotation failure gives a full window of margin
+   before any client fails closed.
+
+13.3.  Revocation procedure
+
+   To de-authorize a credential key (stolen, retired, or belonging to
+   a de-provisioned edge), the owner removes its Anchor entry; service
+   continues uninterrupted on the remaining authorized keys.  To
+   revoke the certificate's usability entirely --- for example, upon
+   end-entity key compromise --- the owner empties or withdraws the
+   Anchor RRset; BRAID-enforcing clients then fail the Identity strand
+   for that certificate.  Propagation is bounded by DNS TTLs and, for
+   clients holding cached proof chains, by the cached material's
+   DNSSEC signature validity; under BRAID-Agile it is additionally
+   bounded by the freshness window.  Owners requiring immediate de-
+   authorization SHOULD both update the Anchor and cease serving the
+   excluded credential.  Conventional CA revocation of the underlying
+   certificate remains available and SHOULD also be performed; the
+   mechanisms are complementary.
+
+14.  Certificate Validity Periods
+
+   This document does not define maximum validity periods for publicly
+   trusted TLS certificates.  Those periods are set by root-program
+   and CA/Browser Forum policy, not by the IETF.  BRAID's protocol
+   claim is narrower: when the Identity strand is enforced, the
+   effective exposure of a stolen end-entity key is bounded by the
+   attacker's inability to authorize a new credential key in the
+   owner's Anchor, and the exposure of a stolen Delegated Credential
+   key is bounded by the applicable credential and Anchor-entry
+   validity intervals.
+
+   A future root-program profile could use deployment evidence from
+   BRAID strict Identity validation to justify a distinct validity
+   class for certificates carrying an enforced Identity strand.  Such
+   a profile is out of scope for this document.  Implementations of
+   this document MUST remain useful at prevailing public-Web
+   certificate lifetimes, and the deployment stages of Section 12 are
+   sequenced so that every stage stands on its own security value with
+   no dependence on any lifetime change.
+
+15.  Security Considerations
+
+   *The two-control property and its collapse conditions.*  The
+   property of Section 4.1 governs the stolen-key analysis: theft of
+   the end-entity private key alone does not permit impersonation of a
+   BRAID-strict domain, and theft of a credential key alone is cured
+   by one Anchor update (and bounded by the window under BRAID-Agile).
+   The property collapses if the two controls are co-resident: a DNS
+   update credential stored on the TLS-terminating host, or a DNS
+   provider account protected by credentials kept alongside the server
+   keys, reduces two controls to one.  Section 4.1's separation
+   guidance is therefore part of the deployment, not an optimization.
+   The property is also only as strong as the owner's DNS publication
+   path: registrar-account takeover, weak registrar authentication, or
+   a compromised DNS operator substitutes for zone compromise, and
+   operators SHOULD apply registry/registrar locks and strong
+   authentication on that path.
+
+   *Downgrade and stripping.*  The validity requirement is carried in
+   a critical certificate extension, reinforced by the TLS Feature
+   extension [RFC7633] and, for enrolled domains, by the policy record
+   and preloaded set of Section 10.  An on-path attacker can withhold
+   BRAID material but cannot make a BRAID certificate validate without
+   it.  The first-contact downgrade surface and its graduated
+   mitigations are analyzed in Section 10; operators for whom the
+   residue is unacceptable use preloading.
+
+   *DNSSEC trust modes.*  The modal design of Section 9 exists because
+   the security of the Anchor check is exactly the security of the
+   DNSSEC validation behind it.  In Public-Web strict mode the
+   verifier's conclusions rest on self-authenticating material; in
+   Managed-Resolver mode they rest additionally on the administrative
+   trust placed in the resolver and the authenticated channel to it.
+   A verifier MUST NOT silently substitute the weaker mode where the
+   stronger is required.
+
+   *Fail-closed availability.*  Strict enforcement couples
+   availability to the owner's DNS publication path and DNSSEC
+   signing.  This is a deliberate reassignment of risk to the party
+   with the power and incentive to manage it, and it is bounded
+   operationally rather than cryptographically: monitor-mode telemetry
+   before enforcement, pre-publication and TTL discipline
+   (Section 13.2), and the prohibition on degradation for strict
+   Identity (Section 12.3), which prevents the soft-fail regression
+   that discredited prior mechanisms.
+
+   *Delegated Credential considerations.*  The cross-protocol and
+   clock-skew considerations of [RFC9345] apply unchanged.  Clock skew
+   additionally bounds how quickly a de-authorization takes effect;
+   Section 13.3 applies.
+
+   *Anchor availability as a target.*  An adversary who can suppress a
+   client's ability to authenticate the Anchor (for example, by
+   blocking proof fetches) achieves denial of service against strict-
+   mode connections, not impersonation.  The negative-caching and
+   size-bounding rules of Section 11.1 bound the amplification of such
+   attacks; the reassignment of this availability risk to the owner is
+   discussed above.
+
+16.  Privacy Considerations
+
+   BRAID introduces no per-connection query to any third party.  The
+   Anchor check is performed against cached, stapled, fetched-by-hash,
+   or distribution-provided material (Section 11); a client MUST NOT
+   emit a per-connection identifying query to a third-party repository
+   as a matter of course, and repository access, where used, is
+   restricted to privacy-preserving transports such as Oblivious HTTP
+   [RFC9458] or batched snapshots.  Where a client queries a resolver
+   for the Anchor name (Managed-Resolver mode), the query is directed
+   to the same resolver that resolved the server's name and reveals
+   nothing that name resolution did not already reveal.  BRAID
+   therefore does not reproduce the OCSP privacy leak.
+
+17.  Implementation Status
+
+   _This section records the status of known implementations per
+   [RFC7942].  RFC Editor: please remove this section before
+   publication._
+
+   No complete implementation of this document exists at the time of
+   writing; the monitor-only mode of Section 12.1 requires none.  The
+   building blocks are individually implemented and deployed:
+   Delegated Credentials [RFC9345] ship in a major browser and in
+   widely used TLS libraries and are deployed by large CDN operators;
+   DNSSEC validation is standard in major recursive resolvers;
+   authenticated browser-distributed data sets (HSTS preload, CRLite-
+   style revocation snapshots) are in production; and ACME automation
+   [RFC8555] is the dominant issuance path.  A monitor-only
+   implementation --- an Anchor publisher plus a scanner comparing
+   observed Delegated Credential keys against Anchor membership,
+   exercising the negative test vectors of Appendix A --- is the
+   authors' immediate target, and reports of independent
+   implementations are solicited for recording here.
+
+18.  IANA Considerations
+
+   This document requests:
+
+   *  a TLS ExtensionType for braid_chain in the TLS ExtensionType
+      Values registry;
+
+   *  a single object identifier for the BRAIDBinding certificate
+      extension, within which all BRAID parameters are serialized, so
+      that no parallel certificate-extension identifiers are required;
+
+   *  a DNS RRTYPE for the BRAID Anchor record and a record format for
+      the BRAID Policy record; and
+
+   *  a registry for BRAID policy modes.
+
+   Several of these registrations require coordination beyond the TLS
+   Working Group, and the work is split accordingly (Appendix B): the
+   Anchor and Policy RRTYPEs require DNS expert review and are
+   expected to involve the DNSOP community; the BRAIDBinding ASN.1
+   warrants LAMPS review; and the extension profiles of Section 19
+   would involve SIDROPS and TRANS respectively if progressed.  Early
+   review by those groups is anticipated.
+
+19.  Future Extension Profiles: Routing and Witness
+
+   The -00 revision of this document defined two further strands as
+   part of the core architecture.  This revision retains them as named
+   extension profiles, described here to show architectural
+   compatibility; they are NOT required for BRAID-Base validation, are
+   not prerequisites for any deployment stage of Section 12, and their
+   full specifications are deferred to companion documents
+   (Appendix B).  Strand indicators for both are reserved in
+   BRAIDBinding (Section 6.2).
+
+   *BRAID-Routed (Routing strand).*  An assertion, checked against
+   routing data validated by RPKI relying-party infrastructure
+   [RFC6480], that the connection originates from an authorized
+   origin AS, optionally narrowed to bound prefixes or addresses.  Its
+   distinct contribution is protection at use time against BGP-hijack
+   interception --- issuance-time hijacks being primarily addressed by
+   the CA/Browser Forum's Multi-Perspective Issuance Corroboration,
+   and independently defeated by the Identity strand, since the
+   owner's Anchor never authorized the resulting certificate's
+   credentials.  A prerequisite is a validated-origin query by which a
+   stub can ask its resolver whether an (address, origin AS) pair is
+   RPKI-valid; that query does not exist today, belongs to the DNSOP/
+   SIDROPS communities, and is named as new work rather than assumed.
+
+   *BRAID-Witnessed (Witness strand).*  A counter-signature over the
+   certificate by an appointed third party, operationally independent
+   of both the issuing CA and the subscriber, anchored in a public
+   log, encoded in the signed-timestamp format of [RFC6962]/[RFC9162].
+   With optional witnessed freshness, the witness's renewal decision
+   becomes a revocation lever that survives the simultaneous
+   compromise of both Identity-strand controls --- the one scenario
+   Section 2 places out of scope for BRAID-Base --- at the cost of a
+   sustained availability dependency on the witness.  Unlike the
+   Routing profile, the Witness profile has no missing protocol
+   dependency: its formats and log infrastructure exist today, and it
+   is deployable now in the managed environments of Section 12.2.  Its
+   full specification --- the co-signing format, witnessed freshness,
+   witness independence and appointment-terms requirements, and
+   private-use gating --- is planned as a near-term companion
+   document.
+
+   Both profiles compose with, and depend on, the Identity strand
+   defined by this document; neither modifies its validation
+   algorithm.
+
+20.  References
+
+20.1.  Normative References
+
+   [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119,
+              DOI 10.17487/RFC2119, March 1997,
+              <https://www.rfc-editor.org/rfc/rfc2119>.
+
+   [RFC5280]  Cooper, D., Santesson, S., Farrell, S., Boeyen, S.,
+              Housley, R., and W. Polk, "Internet X.509 Public Key
+              Infrastructure Certificate and Certificate Revocation
+              List (CRL) Profile", RFC 5280, DOI 10.17487/RFC5280, May
+              2008, <https://www.rfc-editor.org/rfc/rfc5280>.
+
+   [RFC6125]  Saint-Andre, P. and J. Hodges, "Representation and
+              Verification of Domain-Based Application Service
+              Identity within Internet Public Key Infrastructure Using
+              X.509 (PKIX) Certificates in the Context of Transport
+              Layer Security (TLS)", RFC 6125, DOI 10.17487/RFC6125,
+              March 2011, <https://www.rfc-editor.org/rfc/rfc6125>.
+
+   [RFC7633]  Hallam-Baker, P., "X.509v3 Transport Layer Security
+              (TLS) Feature Extension", RFC 7633,
+              DOI 10.17487/RFC7633, October 2015,
+              <https://www.rfc-editor.org/rfc/rfc7633>.
+
+   [RFC8174]  Leiba, B., "Ambiguity of Uppercase vs Lowercase in RFC
+              2119 Key Words", BCP 14, RFC 8174, DOI 10.17487/RFC8174,
+              May 2017, <https://www.rfc-editor.org/rfc/rfc8174>.
+
+   [RFC8446]  Rescorla, E., "The Transport Layer Security (TLS)
+              Protocol Version 1.3", RFC 8446, DOI 10.17487/RFC8446,
+              August 2018, <https://www.rfc-editor.org/rfc/rfc8446>.
+
+   [RFC9345]  Barnes, R., Iyengar, S., Sullivan, N., and E. Rescorla,
+              "Delegated Credentials for TLS and DTLS", RFC 9345,
+              DOI 10.17487/RFC9345, July 2023,
+              <https://www.rfc-editor.org/rfc/rfc9345>.
+
+20.2.  Informative References
+
+   [RFC6480]  Lepinski, M. and S. Kent, "An Infrastructure to Support
+              Secure Internet Routing", RFC 6480,
+              DOI 10.17487/RFC6480, February 2012,
+              <https://www.rfc-editor.org/rfc/rfc6480>.
+
+   [RFC6698]  Hoffman, P. and J. Schlyter, "The DNS-Based
+              Authentication of Named Entities (DANE) Transport Layer
+              Security (TLS) Protocol: TLSA", RFC 6698,
+              DOI 10.17487/RFC6698, August 2012,
+              <https://www.rfc-editor.org/rfc/rfc6698>.
+
+   [RFC6797]  Hodges, J., Jackson, C., and A. Barth, "HTTP Strict
+              Transport Security (HSTS)", RFC 6797,
+              DOI 10.17487/RFC6797, November 2012,
+              <https://www.rfc-editor.org/rfc/rfc6797>.
+
+   [RFC6962]  Laurie, B., Langley, A., and E. Kasper, "Certificate
+              Transparency", RFC 6962, DOI 10.17487/RFC6962, June
+              2013, <https://www.rfc-editor.org/rfc/rfc6962>.
+
+   [RFC7858]  Hu, Z., Zhu, L., Heidemann, J., Mankin, A., Wessels, D.,
+              and P. Hoffman, "Specification for DNS over Transport
+              Layer Security (TLS)", RFC 7858, DOI 10.17487/RFC7858,
+              May 2016, <https://www.rfc-editor.org/rfc/rfc7858>.
+
+   [RFC7942]  Sheffer, Y. and A. Farrel, "Improving Awareness of
+              Running Code: The Implementation Status Section",
+              BCP 205, RFC 7942, DOI 10.17487/RFC7942, July 2016,
+              <https://www.rfc-editor.org/rfc/rfc7942>.
+
+   [RFC8484]  Hoffman, P. and P. McManus, "DNS Queries over HTTPS
+              (DoH)", RFC 8484, DOI 10.17487/RFC8484, October 2018,
+              <https://www.rfc-editor.org/rfc/rfc8484>.
+
+   [RFC8555]  Barnes, R., Hoffman-Andrews, J., McCarney, D., and J.
+              Kasten, "Automatic Certificate Management Environment
+              (ACME)", RFC 8555, DOI 10.17487/RFC8555, March 2019,
+              <https://www.rfc-editor.org/rfc/rfc8555>.
+
+   [RFC9102]  Dukhovni, V., Huque, S., Toorop, W., Wouters, P., and M.
+              Shore, "TLS DNSSEC Chain Extension", RFC 9102,
+              DOI 10.17487/RFC9102, August 2021,
+              <https://www.rfc-editor.org/rfc/rfc9102>.
+
+   [RFC9162]  Laurie, B., Messeri, E., and R. Stradling, "Certificate
+              Transparency Version 2.0", RFC 9162,
+              DOI 10.17487/RFC9162, December 2021,
+              <https://www.rfc-editor.org/rfc/rfc9162>.
+
+   [RFC9458]  Thomson, M. and C. A. Wood, "Oblivious HTTP", RFC 9458,
+              DOI 10.17487/RFC9458, January 2024,
+              <https://www.rfc-editor.org/rfc/rfc9458>.
+
+Appendix A.  Negative Test Vectors
+
+   A specification is only as trustworthy as its fail cases.  The
+   following vectors are normative fail cases for the algorithm of
+   Section 8 and are the recommended initial test suite for monitor
+   and verifier implementations.
+
+   A.1.  Stolen EE key, attacker-minted credential.  Certificate
+         validates; Delegated Credential validates under the EE key;
+         the credential public key is absent from the Anchor.
+         Result: FAIL Identity (step 8).
+
+   A.2.  Authorized credential key, wrong DNS-ID.  The credential key
+         appears in the Anchor entry covering static.example.com; the
+         client validates auth.example.com.  Result: FAIL unless the
+         entry's covered DNS-ID set includes the validated name
+         (steps 7-8).
+
+   A.3.  Unsigned Anchor.  The RRset exists but DNSSEC authentication
+         fails or is absent under the required trust mode.  Result:
+         FAIL Identity (step 6).
+
+   A.4.  Stale credential key.  The credential key was previously
+         authorized but its entry has been removed from the Anchor.
+         Result: FAIL once cached material expires per TTL and
+         signature-validity rules; a monitor reports the transition
+         window (Section 13.3).
+
+   A.5.  Resolver-only AD bit in Public-Web strict mode.  The
+         resolver asserts AD but no verifiable proof material is
+         available.  Result: FAIL Public-Web strict mode (Section 9).
+
+   A.6.  Degradation attempt against strict Identity.  Identity proof
+         is unavailable; the WebPKI certificate otherwise validates.
+         Result: FAIL; degradation is prohibited for strict Identity
+         (Section 12.3).
+
+   A.7.  TLSA usage 1 control case.  A TLSA usage 1 record
+         authenticates the EE key; the attacker holds the stolen EE
+         key.  Expected contrast: TLSA validation does not distinguish
+         attacker use; BRAID fails absent Anchor membership
+         (Section 5).
+
+   A.8.  Multi-SAN mismatch.  The Anchor authorizes a credential key
+         for one SAN of a shared certificate; the client connects to a
+         different SAN.  Result: FAIL unless covered (Section 7.2).
+
+   A.9.  Anchor pointer outside the identity boundary.  BRAIDBinding
+         names an external Anchor without a DNSSEC-authenticated
+         indirection record at the default Anchor name.  Result: FAIL
+         (Section 7.1).
+
+   A.10. Malformed wildcard constraint.  A delegated name constraint
+         uses a partial-label wildcard or an invalid A-label.  Result:
+         FAIL; malformed names are rejected, not repaired
+         (Section 6.3).
+
+Appendix B.  IETF Work-Split Roadmap
+
+   This document does not ask the TLS Working Group to evaluate every
+   component.  The anticipated split, subject to dispatch discussion:
+
+   +----------------------------+-------------------+----------------+
+   | Component                  | Likely venue      | Position       |
+   +----------------------------+-------------------+----------------+
+   | Architecture, threat       | TLS WG / SEC      | This document  |
+   | model, Identity strand,    | dispatch          |                |
+   | negotiation, braid_chain   |                   |                |
+   +----------------------------+-------------------+----------------+
+   | BRAIDBinding ASN.1 module  | LAMPS             | Companion      |
+   |                            |                   | document       |
+   +----------------------------+-------------------+----------------+
+   | Anchor / Policy RRTYPEs    | DNSOP             | Companion      |
+   | and TXT transition         |                   | document       |
+   +----------------------------+-------------------+----------------+
+   | Monitor format and         | OPSEC or          | Independent;   |
+   | aggregate reports          | independent       | useful today   |
+   +----------------------------+-------------------+----------------+
+   | Validated-origin query;    | SIDROPS / DNSOP   | Future         |
+   | Routing profile            |                   | extension      |
+   +----------------------------+-------------------+----------------+
+   | Witness profile and log    | TRANS or separate | Companion      |
+   | entry types                |                   | document,      |
+   |                            |                   | near-term      |
+   +----------------------------+-------------------+----------------+
+   | Any extended-validity      | CA/B Forum / root | Non-IETF; out  |
+   | class                      | programs          | of scope       |
+   +----------------------------+-------------------+----------------+
+
+Appendix C.  Change Log
+
+   _RFC Editor: please remove this section before publication._
+
+   Changes from draft-davey-tls-braid-00, incorporating mailing-list
+   review:
+
+   *  Recentered the document on the two-control property as a
+      consequence of Anchor membership rather than freshness: the
+      property is now stated (Section 4.1) and titled as independent
+      of rotation cadence, the abstract and title were rewritten
+      accordingly, and freshness was moved to the optional BRAID-Agile
+      enforcement profile (Section 12.4).  This resolves the
+      objection that BRAID relocated, rather than reduced, the
+      automation burden of short-lived credentials: under BRAID-Base
+      the Anchor and credential key are static, and the only recurring
+      operation is local credential re-signing with no external
+      dependency (Section 13.1).
+
+   *  Added Section 5, a precise comparison with DANE TLSA usage 1
+      (and usage 3), stating exactly why a static TLSA binding does
+      not stop a stolen end-entity key while Anchor membership does,
+      analyzing the differing revocation-by-withdrawal semantics, and
+      addressing the deployment-inference argument.
+
+   *  Replaced the implicit resolver trust story with two explicit
+      DNSSEC validation modes (Section 9): Public-Web strict (self-
+      authenticating proof material only; unauthenticated AD bits
+      insufficient) and Managed-Resolver (administratively trusted
+      validating resolver over an authenticated channel), with a
+      prohibition on silent substitution.
+
+   *  Prohibited graceful degradation for strict Identity
+      (Section 12.3), removing the -00 degradation option for the
+      Identity strand entirely; degradation semantics, if any, now
+      belong only to future extension strands.
+
+   *  Made Anchor placement deterministic (Section 7): default
+      _braid.<DNS-ID> location, authenticated-indirection rule for
+      external Anchors, explicit exclusion of CNAME chasing as an
+      authorization mechanism, and multi-SAN/wildcard coverage rules.
+
+   *  Replaced the normative five-year validity claim with
+      Section 14: validity periods are root-program policy, out of
+      scope; implementations must be useful at prevailing lifetimes;
+      any extended-validity class is future non-IETF policy contingent
+      on deployment evidence.
+
+   *  Moved the Routing and Witness strands to Future Extension
+      Profiles (Section 19) with their specifications deferred to
+      companion documents; reserved their BRAIDBinding indicators;
+      reduced the IANA footprint accordingly.  The two profiles have
+      opposite readiness: the Witness profile has no missing protocol
+      dependency and its companion document is near-term, while the
+      Routing profile waits on the validated-origin query.
+
+   *  Added the normative validation algorithm (Section 8), the
+      negative test vectors (Appendix A), the monitor-only deployment
+      section (Section 12.1), the Non-Goals section (Section 2), and
+      the IETF work-split roadmap (Appendix B).
+
+   *  Retained from -00 without substantive change: negotiation and
+      certificate selection with operational isolation and downgrade
+      resistance (Section 10), reference-based proof transport with
+      DoS bounds and privacy rules (Section 11), delegated name
+      constraints with A-label matching rules (Section 6.3), and the
+      rotation-at-scale guidance, now scoped to BRAID-Agile
+      (Section 13.2).
+
+Author's Address
+
+   George Davey
+   Davey Group LLC
+   Email: BRAID@cpu.io
